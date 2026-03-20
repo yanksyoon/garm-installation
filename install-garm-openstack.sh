@@ -74,9 +74,10 @@ load_config() {
       if [[ "$val" =~ ^\"(.*)\"$ ]] || [[ "$val" =~ ^\'(.*)\'$ ]]; then
         val="${BASH_REMATCH[1]}"
       fi
-      # Only set if NOT already present in the calling environment.
-      # ${!var+x} expands to 'x' if var is set (even if empty), '' if unset.
-      if [[ -z "${!var+x}" ]]; then
+      # Only set if not already present and non-empty in the calling environment.
+      # An empty env var (e.g. OS_USERNAME= left over from a cloud session) is
+      # treated as unset so the config file value wins over it.
+      if [[ -z "${!var}" ]]; then
         export "$var=$val"
       fi
     else
@@ -146,6 +147,8 @@ CONTROLLER_NAME=local-openstack
 
 # GARM admin account credentials.
 # ADMIN_PASSWORD is required when INIT_GARM=true.
+# GARM enforces a minimum password strength (zxcvbn score >= 2).
+# Use at least 10 characters with a mix of upper/lower case, digits, and symbols.
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=                   # REQUIRED
 ADMIN_EMAIL=admin@example.com
@@ -489,7 +492,7 @@ SCOPE_ID=""   # ID of the registered repo / org / enterprise used for pool creat
 # Helper functions
 # ===========================================================================
 
-rand_alnum()      { tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$1"; }
+rand_alnum()      { (set +o pipefail; tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$1"); }
 download_release() { curl -fsSL --max-time 120 "$1" -o "$2"; }
 
 # ---------------------------------------------------------------------------
@@ -853,30 +856,48 @@ init_garm() {
   [[ -n "$ADMIN_PASSWORD" ]] || die "INIT_GARM=true requires ADMIN_PASSWORD to be set"
 
   log "Initializing garm controller..."
-  local init_output init_exit
-  init_output="$("$GARM_CLI_BIN" init \
-    --name="$CONTROLLER_NAME" \
-    --url="http://${BIND_ADDR}:${PORT}" \
-    --username="$ADMIN_USERNAME" \
-    --password="$ADMIN_PASSWORD" \
-    --email="$ADMIN_EMAIL" \
-    --full-name="$ADMIN_FULL_NAME" \
-    --metadata-url="http://${BIND_ADDR}:${PORT}/api/v1/metadata" \
-    --callback-url="http://${BIND_ADDR}:${PORT}/api/v1/callbacks" \
-    --webhook-url="http://${BIND_ADDR}:${PORT}/webhooks" 2>&1)" || init_exit=$?
 
-  if [[ -n "${init_exit:-}" ]]; then
-    # Surface the actual error from garm-cli so the user knows the real cause
-    printf '%s\n' "$init_output" >&2
-    if echo "$init_output" | grep -qi "already"; then
+  # Use the REST API directly so init works non-interactively in all environments.
+  # garm-cli init opens /dev/tty for a confirm-password prompt even when
+  # --password is supplied, which breaks headless/CI runs.
+  local payload resp http_code
+  payload=$(jq -n \
+    --arg u  "$ADMIN_USERNAME" \
+    --arg p  "$ADMIN_PASSWORD" \
+    --arg e  "$ADMIN_EMAIL" \
+    --arg fn "$ADMIN_FULL_NAME" \
+    --arg mu "http://${BIND_ADDR}:${PORT}/api/v1/metadata" \
+    --arg cu "http://${BIND_ADDR}:${PORT}/api/v1/callbacks" \
+    --arg wu "http://${BIND_ADDR}:${PORT}/webhooks" \
+    '{username:$u,password:$p,email:$e,full_name:$fn,metadata_url:$mu,callback_url:$cu,webhook_url:$wu}')
+
+  resp=$(curl -s -w '\n__HTTP_CODE__%{http_code}' \
+    -X POST "http://${BIND_ADDR}:${PORT}/api/v1/first-run" \
+    -H 'Content-Type: application/json' \
+    -d "$payload")
+  http_code="${resp##*__HTTP_CODE__}"
+  resp="${resp%__HTTP_CODE__*}"
+
+  case "$http_code" in
+    200|201)
+      log "garm controller initialized."
+      ;;
+    409)
       die "garm is already initialized. Re-run with INIT_GARM=false to skip this step."
-    elif echo "$init_output" | grep -qi "connection refused\|dial\|no such host"; then
-      die "garm API is not reachable at http://${BIND_ADDR}:${PORT}. Check that BIND_ADDR is correct and garm is running."
-    else
-      die "garm init failed (exit ${init_exit}). See output above."
-    fi
-  fi
-  log "garm initialized. Profile '${CONTROLLER_NAME}' saved."
+      ;;
+    400)
+      if echo "$resp" | grep -qi "too weak"; then
+        die "garm init failed: password is too weak. Use a stronger password (>=10 chars, mixed case, digits and symbols)."
+      fi
+      die "garm init failed (HTTP 400): $resp"
+      ;;
+    000)
+      die "garm API is not reachable at http://${BIND_ADDR}:${PORT}. Check BIND_ADDR and that garm is running."
+      ;;
+    *)
+      die "garm init failed (HTTP ${http_code}): $resp"
+      ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
