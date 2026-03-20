@@ -1,0 +1,193 @@
+# =============================================================================
+# GARM OpenStack Installation — Configuration File
+#
+# This file is loaded by install-garm-openstack.sh when passed via --config.
+# Values here are overridden by shell environment variables, and override the
+# script's built-in defaults.
+#
+# Format: KEY=VALUE  or  KEY="value with spaces"
+# Lines starting with # are comments. Inline comments are supported.
+#
+# Usage:
+#   ./install-garm-openstack.sh --config garm-install.conf
+# =============================================================================
+
+# =============================================================================
+# BINARY VERSIONS
+# =============================================================================
+
+# GARM server and CLI version to download from GitHub releases.
+GARM_VERSION=v0.1.7
+
+# OpenStack external provider version.
+OPENSTACK_PROVIDER_VERSION=v0.1.3
+
+# =============================================================================
+# INSTALL LAYOUT
+# =============================================================================
+
+# Root directory for all GARM files (binaries, configs, data, logs).
+INSTALL_DIR=/home/ubuntu/garm-runtime
+
+# =============================================================================
+# GARM SERVER
+# =============================================================================
+
+# IP address the GARM API listens on.
+# IMPORTANT: for OpenStack deployments this must be the host's reachable IP
+# on the runner network (not 127.0.0.1), because runner VMs use this address
+# to call back to GARM during bootstrap.
+BIND_ADDR=10.0.0.1
+
+# TCP port the GARM API listens on.
+PORT=8080
+
+# Name for this GARM controller (used as the garm-cli profile name).
+CONTROLLER_NAME=local-openstack
+
+# GARM admin account credentials.
+# ADMIN_PASSWORD is required when INIT_GARM=true.
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=                   # REQUIRED
+ADMIN_EMAIL=admin@example.com
+ADMIN_FULL_NAME="Local Admin"
+
+# =============================================================================
+# BEHAVIOUR FLAGS
+# =============================================================================
+
+# Start the garm daemon after installing binaries and writing configs.
+START_GARM=true
+
+# If a garm process is already running with this config, stop it first.
+STOP_EXISTING_GARM=true
+
+# Initialize garm (create admin user) on first install.
+# Set to false on re-runs once garm is already initialized.
+INIT_GARM=true
+
+# Overwrite existing config.toml / openstack-provider.toml / clouds.yaml.
+# Set to true if you change any of the settings below and want them applied.
+FORCE_WRITE_CONFIG=false
+
+# =============================================================================
+# OPENSTACK CREDENTIALS
+# =============================================================================
+
+# Name of the cloud entry in clouds.yaml (used by the provider binary).
+OS_CLOUD_NAME=openstack
+
+# Keystone v3 authentication endpoint.
+OS_AUTH_URL=https://keystone.example.com:5000/v3     # REQUIRED
+
+# OpenStack user credentials.
+OS_USERNAME=                      # REQUIRED
+OS_PASSWORD=                      # REQUIRED
+OS_PROJECT_NAME=                  # REQUIRED
+
+# Domain names for the user and project (usually "Default").
+OS_USER_DOMAIN_NAME=Default
+OS_PROJECT_DOMAIN_NAME=Default
+
+# OpenStack region and endpoint interface.
+OS_REGION_NAME=RegionOne          # REQUIRED — set to your actual region
+OS_INTERFACE=public
+
+# =============================================================================
+# OPENSTACK INFRASTRUCTURE
+# =============================================================================
+
+# UUID of the OpenStack network runner VMs will be attached to.
+# Find with: openstack network list
+NETWORK_ID=                       # REQUIRED
+
+# Security group(s) applied to runner VMs (comma-separated).
+OS_SECURITY_GROUPS=default
+
+# Set to true to suppress apt package upgrades during cloud-init
+# (upgrades run before the proxy is set up and will fail noisily).
+DISABLE_UPDATES_ON_BOOT=false
+
+# =============================================================================
+# EGRESS PROXY (runner VMs)
+# =============================================================================
+
+# Runner VMs have no direct internet access. All outbound HTTP/HTTPS is
+# intercepted by nft DNAT rules and forwarded through a local aproxy snap,
+# which proxies to this upstream HTTP/HTTPS proxy.
+#
+# The runner VM image must have the aproxy snap pre-installed.
+EGRESS_PROXY=egress.example.internal:3128    # REQUIRED
+
+# Port aproxy listens on inside each runner VM.
+APROXY_LOCAL_PORT=8443
+
+# IP ranges NOT redirected through the proxy (must include GARM server IP,
+# egress proxy IPs, and all RFC1918 ranges).
+NFT_EXCLUDE_RANGES=10.0.0.0-10.129.255.255, 10.151.0.0-10.255.255.255, 127.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+
+# =============================================================================
+# GITHUB INTEGRATION
+# =============================================================================
+
+# GitHub Personal Access Token.
+# Required scopes: repo, admin:repo_hook
+# For org runners also: admin:org
+GITHUB_PAT=                       # REQUIRED
+
+# GitHub endpoint name (use "github.com" for public GitHub).
+GITHUB_ENDPOINT=github.com
+
+# Name and description for the stored credential in GARM.
+GITHUB_CREDENTIALS_NAME=garm
+GITHUB_CREDENTIALS_DESC="GitHub PAT for GARM"
+
+# Runner scope — where runners will be available:
+#   repo        a single repository  (needs REPO_OWNER + REPO_NAME)
+#   org         all repos in an org  (needs ORG_NAME)
+#   enterprise  GitHub Enterprise    (needs ENTERPRISE_NAME)
+RUNNER_SCOPE=                     # REQUIRED: repo | org | enterprise
+
+# --- repo scope ---
+REPO_OWNER=                       # required when RUNNER_SCOPE=repo
+REPO_NAME=                        # required when RUNNER_SCOPE=repo
+
+# --- org scope ---
+ORG_NAME=                         # required when RUNNER_SCOPE=org
+
+# --- enterprise scope ---
+ENTERPRISE_NAME=                  # required when RUNNER_SCOPE=enterprise
+
+# Generate a random webhook secret when registering the repo/org.
+RANDOM_WEBHOOK_SECRET=true
+
+# =============================================================================
+# RUNNER POOL
+# =============================================================================
+
+# OpenStack image ID for runner VMs.
+# The image must have the aproxy snap pre-installed.
+# Find with: openstack image list
+POOL_IMAGE=                       # REQUIRED
+
+# OpenStack flavor for runner VMs.
+POOL_FLAVOR=shared.small
+
+# OS type and architecture.
+POOL_OS_TYPE=linux
+POOL_OS_ARCH=amd64
+
+# Maximum number of runners GARM will create in this pool.
+POOL_MAX_RUNNERS=5
+
+# Minimum number of idle runners GARM will maintain.
+POOL_MIN_IDLE=1
+
+# Comma-separated runner labels visible in GitHub Actions workflows.
+POOL_TAGS=generic,ubuntu
+
+# Prefix for runner VM names (e.g. "garm-abc123").
+POOL_RUNNER_PREFIX=garm
+
+# Minutes after which a bootstrapping runner is considered failed.
+POOL_BOOTSTRAP_TIMEOUT=20
