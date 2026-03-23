@@ -426,7 +426,7 @@ NETWORK_ID="${NETWORK_ID:-00000000-0000-0000-0000-000000000000}"
 # Comma-separated security group names to apply to runner VMs
 OS_SECURITY_GROUPS="${OS_SECURITY_GROUPS:-default}"
 # Set to true to suppress apt upgrades that run before the proxy is ready
-DISABLE_UPDATES_ON_BOOT="${DISABLE_UPDATES_ON_BOOT:-false}"
+DISABLE_UPDATES_ON_BOOT="${DISABLE_UPDATES_ON_BOOT:-true}"
 
 # ---------------------------------------------------------------------------
 # GitHub integration
@@ -774,7 +774,7 @@ default_security_groups = ${sg_toml}
 network_id              = "${NETWORK_ID}"
 boot_from_volume        = false
 root_disk_size          = 30
-use_config_drive        = false
+use_config_drive        = true 
 disable_updates_on_boot = ${DISABLE_UPDATES_ON_BOOT}
 
 [credentials]
