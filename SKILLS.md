@@ -308,6 +308,84 @@ Common causes: wrong `BIND_ADDR`, port already in use, corrupted DB.
 | `no token is available and METADATA_URL is not set` | Template variables not rendered | Check extra-specs are applied to pool |
 | No output after cloud-init | cloud-init error | Check full console log for init failures |
 
+### SSH into a runner VM for debugging
+
+Runner VMs are on the `10.151.114.0/24` subnet. The GARM host can reach them
+directly (L3 routing is in place).
+
+**Step 1 — Enable SSH key injection** (one-time setup, or set in `garm-install.conf`):
+
+```bash
+# Generate a dedicated debug keypair if you don't have one
+ssh-keygen -t ed25519 -C "garm-runner-debug" -f /home/ubuntu/garm-runner-debug-key -N ""
+```
+
+Set `DEBUG_SSH_PUBLIC_KEY` in `garm-install.conf`:
+```
+DEBUG_SSH_PUBLIC_KEY=/home/ubuntu/garm-runner-debug-key.pub
+```
+
+Or inject the key into an existing pool immediately via `pre_install_scripts`:
+
+```bash
+PUBKEY=$(cat /home/ubuntu/garm-runner-debug-key.pub)
+SCRIPT_B64=$(printf '#!/bin/bash\nset -e\nmkdir -p /home/ubuntu/.ssh\nprintf "%%s\n" "%s" >> /home/ubuntu/.ssh/authorized_keys\nchown -R ubuntu:ubuntu /home/ubuntu/.ssh\nchmod 700 /home/ubuntu/.ssh\nchmod 600 /home/ubuntu/.ssh/authorized_keys\n' "$PUBKEY" | base64 -w0)
+
+EXISTING_TEMPLATE=$(/home/ubuntu/garm-runtime/bin/garm-cli pool show f8e7c17d-1eee-4b34-886f-724a814a17d7 \
+  --format=json | jq -r '.extra_specs.runner_install_template')
+
+/home/ubuntu/garm-runtime/bin/garm-cli pool update f8e7c17d-1eee-4b34-886f-724a814a17d7 \
+  --extra-specs="{\"runner_install_template\": \"${EXISTING_TEMPLATE}\", \
+                  \"pre_install_scripts\": {\"00-inject-debug-ssh-key\": \"${SCRIPT_B64}\"}}"
+```
+
+**Step 2 — Get the runner IP**:
+
+```bash
+source /home/ubuntu/garm-installation/openstack_creds
+openstack server list --format=table -c Name -c Networks | grep garm-
+```
+
+**Step 3 — SSH in** (wait ~2 min after VM appears ACTIVE for cloud-init to finish):
+
+```bash
+ssh -i /home/ubuntu/garm-runner-debug-key ubuntu@<RUNNER_IP>
+```
+
+**Step 4 — Useful commands on the runner**:
+
+```bash
+# Check cloud-init progress
+sudo cloud-init status --long
+
+# Watch the runner install script output
+sudo cat /var/log/cloud-init-output.log
+
+# Check aproxy
+snap services aproxy
+sudo nft list table ip aproxy
+
+# Check runner service
+systemctl status 'actions.runner.*'
+sudo journalctl -u 'actions.runner.*' -f
+
+# Test proxy
+curl -v https://github.com 2>&1 | grep -E "Connected|SSL"
+
+# Test GARM callback reachability
+curl -v --max-time 5 http://10.152.117.27:8080/api/v1/metadata/v1/ 2>&1 | tail -5
+```
+
+**Remove the debug key when done** (to avoid leaving it in production runners):
+
+```bash
+/home/ubuntu/garm-runtime/bin/garm-cli pool update f8e7c17d-1eee-4b34-886f-724a814a17d7 \
+  --extra-specs="{\"runner_install_template\": \"${EXISTING_TEMPLATE}\"}"
+```
+
+Or set `DEBUG_SSH_PUBLIC_KEY=` (empty) in `garm-install.conf` and re-run the installer
+with `FORCE_WRITE_CONFIG=false` (pool update only).
+
 ### Verify proxy inside a runner VM
 
 ```bash

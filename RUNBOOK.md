@@ -239,6 +239,62 @@ sudo nft list table ip aproxy
 curl -v https://github.com 2>&1 | grep -E "Connected|SSL"
 ```
 
+### SSH into a runner VM for debugging
+
+Runner VMs are on `10.151.114.0/24` and are directly reachable from the GARM host.
+
+**Enable SSH key injection via `garm-install.conf`** (persisted across reinstalls):
+
+```
+DEBUG_SSH_PUBLIC_KEY=/home/ubuntu/garm-runner-debug-key.pub
+```
+
+When set, the install script encodes a `pre_install_script` into the pool's
+`extra_specs` that appends the public key to `/home/ubuntu/.ssh/authorized_keys`
+on every runner VM before the runner agent is installed.
+
+**Generate a dedicated debug keypair** (one-time):
+
+```bash
+ssh-keygen -t ed25519 -C "garm-runner-debug" \
+  -f /home/ubuntu/garm-runner-debug-key -N ""
+```
+
+**Inject into an existing pool immediately** (without re-running the installer):
+
+```bash
+PUBKEY=$(cat /home/ubuntu/garm-runner-debug-key.pub)
+SCRIPT_B64=$(printf '#!/bin/bash\nset -e\nmkdir -p /home/ubuntu/.ssh\nprintf "%%s\n" "%s" >> /home/ubuntu/.ssh/authorized_keys\nchown -R ubuntu:ubuntu /home/ubuntu/.ssh\nchmod 700 /home/ubuntu/.ssh\nchmod 600 /home/ubuntu/.ssh/authorized_keys\n' \
+  "$PUBKEY" | base64 -w0)
+
+TEMPLATE=$(/home/ubuntu/garm-runtime/bin/garm-cli pool show f8e7c17d-1eee-4b34-886f-724a814a17d7 \
+  --format=json | jq -r '.extra_specs.runner_install_template')
+
+/home/ubuntu/garm-runtime/bin/garm-cli pool update f8e7c17d-1eee-4b34-886f-724a814a17d7 \
+  --extra-specs="{\"runner_install_template\": \"${TEMPLATE}\", \
+                  \"pre_install_scripts\": {\"00-inject-debug-ssh-key\": \"${SCRIPT_B64}\"}}"
+```
+
+**SSH into a runner** (wait ~2 min after VM becomes ACTIVE):
+
+```bash
+source /home/ubuntu/garm-installation/openstack_creds
+RUNNER_IP=$(openstack server list --format=json \
+  | jq -r '.[] | select(.Name | startswith("garm-")) | .Networks | to_entries[0].value[0]')
+ssh -i /home/ubuntu/garm-runner-debug-key ubuntu@"$RUNNER_IP"
+```
+
+**Remove the debug key for production** — set `DEBUG_SSH_PUBLIC_KEY=` (empty) in
+`garm-install.conf` and update the pool extra-specs to remove `pre_install_scripts`:
+
+```bash
+TEMPLATE=$(/home/ubuntu/garm-runtime/bin/garm-cli pool show f8e7c17d-1eee-4b34-886f-724a814a17d7 \
+  --format=json | jq -r '.extra_specs.runner_install_template')
+
+/home/ubuntu/garm-runtime/bin/garm-cli pool update f8e7c17d-1eee-4b34-886f-724a814a17d7 \
+  --extra-specs="{\"runner_install_template\": \"${TEMPLATE}\"}"
+```
+
 ### Manually trigger a new runner
 
 ```bash
@@ -280,8 +336,21 @@ su -l -c /install_runner.sh runner
 - **`package_upgrade: true`** in the default cloud-init config runs before nft rules
   are in place, so apt upgrades fail at boot. This is cosmetic noise — the runner
   install itself succeeds. To suppress: set `disable_updates_on_boot = true` in
-  `openstack-provider.toml`.
+  `openstack-provider.toml` (the install script does this by default via
+  `DISABLE_UPDATES_ON_BOOT=true` in `garm-install.conf`).
 
 - The `runner_install_template` source file at `/tmp/install_runner_template.sh` is
   not persisted across reboots of the GARM server. Keep a copy elsewhere or re-derive
-  it by base64-decoding the pool's extra-specs.
+  it by base64-decoding the pool's extra-specs:
+  ```bash
+  /home/ubuntu/garm-runtime/bin/garm-cli pool show f8e7c17d-1eee-4b34-886f-724a814a17d7 \
+    --format json | jq -r '.extra_specs.runner_install_template' | base64 -d
+  ```
+
+- **SSH key injection via `pre_install_scripts`** leaves the debug key in place for
+  the lifetime of the pool. Remove it for production deployments (see
+  [SSH into a runner VM for debugging](#ssh-into-a-runner-vm-for-debugging)).
+
+- **`use_config_drive = true`** is required. Without it cloud-init cannot find its
+  datasource on this network (the Nova metadata service at `169.254.169.254` is not
+  reachable), so the entire runner bootstrap script never runs.

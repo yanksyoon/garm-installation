@@ -427,6 +427,12 @@ NETWORK_ID="${NETWORK_ID:-00000000-0000-0000-0000-000000000000}"
 OS_SECURITY_GROUPS="${OS_SECURITY_GROUPS:-default}"
 # Set to true to suppress apt upgrades that run before the proxy is ready
 DISABLE_UPDATES_ON_BOOT="${DISABLE_UPDATES_ON_BOOT:-true}"
+# Optional: path to a public key file to inject into runner VMs for SSH debugging.
+# When set, the key is added to /home/ubuntu/.ssh/authorized_keys on every runner
+# via a pre_install_script, allowing direct SSH access for debugging.
+# Leave empty to skip.
+# Example: DEBUG_SSH_PUBLIC_KEY="/home/ubuntu/.ssh/id_ed25519.pub"
+DEBUG_SSH_PUBLIC_KEY="${DEBUG_SSH_PUBLIC_KEY:-}"
 
 # ---------------------------------------------------------------------------
 # GitHub integration
@@ -774,7 +780,7 @@ default_security_groups = ${sg_toml}
 network_id              = "${NETWORK_ID}"
 boot_from_volume        = false
 root_disk_size          = 30
-use_config_drive        = true 
+use_config_drive        = true
 disable_updates_on_boot = ${DISABLE_UPDATES_ON_BOOT}
 
 [credentials]
@@ -1260,6 +1266,26 @@ create_pool() {
   local template_b64
   template_b64="$(build_runner_install_template_b64)"
 
+  # Build extra-specs JSON. Start with the runner install template, then
+  # optionally append a pre_install_script that injects a debug SSH public key.
+  local extra_specs
+  extra_specs="{\"runner_install_template\": \"${template_b64}\"}"
+
+  if [[ -n "${DEBUG_SSH_PUBLIC_KEY:-}" ]]; then
+    if [[ ! -f "$DEBUG_SSH_PUBLIC_KEY" ]]; then
+      log "WARNING: DEBUG_SSH_PUBLIC_KEY='${DEBUG_SSH_PUBLIC_KEY}' not found — skipping SSH key injection."
+    else
+      local pubkey script_b64
+      pubkey="$(cat "$DEBUG_SSH_PUBLIC_KEY")"
+      # Build a small pre-install script that appends the key to authorized_keys.
+      # Runs as root before the main runner install script.
+      script_b64="$(printf '#!/bin/bash\nset -e\nmkdir -p /home/ubuntu/.ssh\nprintf "%%s\\n" "%s" >> /home/ubuntu/.ssh/authorized_keys\nchown -R ubuntu:ubuntu /home/ubuntu/.ssh\nchmod 700 /home/ubuntu/.ssh\nchmod 600 /home/ubuntu/.ssh/authorized_keys\n' "$pubkey" | base64 -w0)"
+      extra_specs="$(printf '{"runner_install_template": "%s", "pre_install_scripts": {"00-inject-debug-ssh-key": "%s"}}' \
+        "$template_b64" "$script_b64")"
+      log "SSH public key from '${DEBUG_SSH_PUBLIC_KEY}' will be injected into runner VMs."
+    fi
+  fi
+
   log "Creating runner pool (scope: ${RUNNER_SCOPE})..."
   "$GARM_CLI_BIN" pool add \
     $scope_flag \
@@ -1273,9 +1299,134 @@ create_pool() {
     --tags="$POOL_TAGS" \
     --runner-prefix="$POOL_RUNNER_PREFIX" \
     --runner-bootstrap-timeout="$POOL_BOOTSTRAP_TIMEOUT" \
-    --extra-specs="{\"runner_install_template\": \"${template_b64}\"}" \
+    --extra-specs="${extra_specs}" \
     --enabled
   log "Pool created."
+}
+
+# ---------------------------------------------------------------------------
+# configure_runner_network_route
+#
+# Ensures runner VMs can reach the GARM callback/metadata API at BIND_ADDR.
+#
+# Problem: runner VMs live on an isolated tenant network (NETWORK_ID) whose
+# gateway only has routes to specific infrastructure hosts.  Without an
+# explicit host route injected via DHCP, runner VMs have no path to
+# BIND_ADDR and every callback/metadata curl in the bootstrap script times
+# out, leaving the runner permanently offline.
+#
+# What this function does:
+#   1. Injects a /32 host route for BIND_ADDR into the runner subnet via
+#      Neutron DHCP (openstack subnet set --host-route).  New VMs pick this
+#      up automatically; existing VMs need a DHCP renewal or reboot.
+#   2. Adds a static route on this host for the runner subnet CIDR so that
+#      GARM can respond to TCP connections initiated by runner VMs.  The
+#      route is written to a netplan drop-in file so it survives reboots.
+#
+# Prerequisite (outside this script's control):
+#   The L3 gateway serving the runner subnet must also have a route to
+#   BIND_ADDR.  In most OpenStack deployments this means the Neutron router
+#   attached to the runner subnet must be able to forward packets destined
+#   for BIND_ADDR out of its external interface onto the provider network
+#   where the GARM host lives.  If that route is missing the host route
+#   injected here is necessary but not sufficient — contact the OpenStack
+#   infrastructure admin and ask them to add a static route for
+#   ${BIND_ADDR}/32 to the router that serves network ${NETWORK_ID}.
+# ---------------------------------------------------------------------------
+configure_runner_network_route() {
+  # Gracefully skip if the openstack CLI is not available.
+  if ! has_cmd openstack; then
+    log "WARNING: 'openstack' CLI not found — skipping runner subnet host route."
+    log "  Manually run after install:"
+    log "    openstack subnet set --host-route destination=${BIND_ADDR}/32,gateway=<gw> <subnet_id>"
+    return 0
+  fi
+
+  # Gracefully skip if required OpenStack credentials are missing.
+  local cred_ok=true
+  for var in OS_AUTH_URL OS_USERNAME OS_PASSWORD OS_PROJECT_NAME; do
+    [[ -z "${!var:-}" ]] && { log "WARNING: $var not set — skipping runner subnet host route."; cred_ok=false; break; }
+  done
+  [[ "$cred_ok" == "false" ]] && return 0
+
+  log "Configuring runner subnet host route for GARM at ${BIND_ADDR}..."
+
+  # Resolve the subnet ID from the runner network UUID.
+  local subnet_id
+  subnet_id="$(openstack network show "$NETWORK_ID" -c subnets -f value 2>/dev/null \
+    | tr -d '[],\n ' | awk '{print $1}')"
+  if [[ -z "$subnet_id" ]]; then
+    log "WARNING: Could not resolve subnet for network ${NETWORK_ID} — skipping host route."
+    return 0
+  fi
+
+  local gateway_ip cidr
+  gateway_ip="$(openstack subnet show "$subnet_id" -c gateway_ip -f value 2>/dev/null)"
+  cidr="$(openstack subnet show "$subnet_id"       -c cidr       -f value 2>/dev/null)"
+
+  if [[ -z "$gateway_ip" || -z "$cidr" ]]; then
+    log "WARNING: Could not read subnet ${subnet_id} details — skipping host route."
+    return 0
+  fi
+
+  # Inject host route into runner subnet DHCP (idempotent).
+  local existing_routes
+  existing_routes="$(openstack subnet show "$subnet_id" -c host_routes -f value 2>/dev/null)"
+  if echo "$existing_routes" | grep -qF "${BIND_ADDR}"; then
+    log "Host route for ${BIND_ADDR}/32 already present in subnet ${subnet_id}."
+  else
+    openstack subnet set \
+      --host-route "destination=${BIND_ADDR}/32,gateway=${gateway_ip}" \
+      "$subnet_id"
+    log "Injected DHCP host route: ${BIND_ADDR}/32 → ${gateway_ip} (subnet ${subnet_id})."
+  fi
+
+  # Add a return route on this host for the runner subnet CIDR.
+  local default_gw
+  default_gw="$(ip route show default 2>/dev/null | awk '{print $3; exit}')"
+  if [[ -z "$default_gw" ]]; then
+    log "WARNING: Could not determine default gateway — skipping static route on this host."
+    return 0
+  fi
+
+  if ip route show | grep -qF "$cidr"; then
+    log "Static route to runner subnet ${cidr} already present on this host."
+  else
+    ip route add "$cidr" via "$default_gw" 2>/dev/null \
+      && log "Added transient route: ${cidr} via ${default_gw}." \
+      || log "WARNING: Could not add transient route to ${cidr}."
+  fi
+
+  # Persist the route across reboots via a netplan drop-in.
+  local netplan_file="/etc/netplan/99-garm-runner-route.yaml"
+  if [[ ! -f "$netplan_file" ]]; then
+    # Determine the primary interface name dynamically.
+    local iface
+    iface="$(ip route show default 2>/dev/null | awk '{print $5; exit}')"
+    iface="${iface:-ens3}"
+    cat > "$netplan_file" <<NETPLAN
+network:
+  version: 2
+  ethernets:
+    ${iface}:
+      routes:
+        - to: ${cidr}
+          via: ${default_gw}
+NETPLAN
+    chmod 600 "$netplan_file"
+    netplan apply 2>/dev/null || true
+    log "Wrote persistent route to ${netplan_file}."
+  fi
+
+  log "Runner network routing configured."
+  log ""
+  log "  ┌─ IMPORTANT ──────────────────────────────────────────────────────────┐"
+  log "  │ The Neutron router serving network ${NETWORK_ID}  │"
+  log "  │ must also have a route to ${BIND_ADDR}/32.                           │"
+  log "  │ If callbacks still fail, ask the OpenStack admin to run:             │"
+  log "  │   openstack router set <router-id> \\                                │"
+  log "  │     --route destination=${BIND_ADDR}/32,gateway=<external-next-hop> │"
+  log "  └──────────────────────────────────────────────────────────────────────┘"
 }
 
 # ===========================================================================
@@ -1333,6 +1484,13 @@ main() {
   add_github_credentials
   register_github_target
   create_pool
+
+  # -- Inject runner subnet host route for GARM callback reachability -------
+  # Runner VMs need a route to BIND_ADDR so they can POST their status back
+  # to GARM.  This step adds the route via Neutron DHCP (so every new VM
+  # picks it up automatically) and also adds a persistent return route on
+  # this host for the runner subnet.
+  configure_runner_network_route
 
   log ""
   log "=== Installation complete ==="

@@ -104,9 +104,19 @@ NETWORK_ID=                       # REQUIRED
 # Security group(s) applied to runner VMs (comma-separated).
 OS_SECURITY_GROUPS=default
 
-# Set to true to suppress apt package upgrades during cloud-init
-# (upgrades run before the proxy is set up and will fail noisily).
-DISABLE_UPDATES_ON_BOOT=false
+# Must be true: apt runs during cloud-init config stage, before the runner
+# install script sets up aproxy and the NFT redirect rules. Without this flag
+# apt tries to reach package mirrors directly, fails with connection timeouts,
+# and adds ~80 s of unnecessary delay on every runner boot.
+DISABLE_UPDATES_ON_BOOT=true
+
+# Optional: path to an SSH public key file to inject into runner VMs.
+# When set, the key is appended to /home/ubuntu/.ssh/authorized_keys on every
+# runner via a pre_install_script, enabling direct SSH access for debugging.
+# Leave empty (or omit) for production deployments.
+# Generate a keypair with:
+#   ssh-keygen -t ed25519 -C "garm-runner-debug" -f ~/.ssh/garm-runner-debug -N ""
+DEBUG_SSH_PUBLIC_KEY=
 
 # =============================================================================
 # EGRESS PROXY (runner VMs)
